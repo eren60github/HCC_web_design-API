@@ -321,8 +321,14 @@ async def evaluate_hcc_risk(
     pst_score: Optional[int] = Form(0)
 
 ):
-    overall_risk_level, detailed_report_summary, vlm_radiology_report = "Düşük Risk", [], None
-    mri_analysis_result, lab_result, usg_result, gemini_comprehensive_report = {}, {}, {}, None
+    overall_risk_level = "Düşük Risk"
+    detailed_report_summary = []
+    vlm_radiology_report = None
+    mri_analysis_result = {}
+    lab_result = {}
+    usg_result = {}
+    gemini_comprehensive_report = None
+    doctor_note = None
 
     try:
         lab_data_dict = json.loads(lab_data)
@@ -353,15 +359,26 @@ async def evaluate_hcc_risk(
         except Exception as e:
             detailed_report_summary.append(f"MRI Analizi Hatası: {e.detail if isinstance(e, HTTPException) else str(e)}")
 
-        try:
-            doctor_note
-        except NameError:
-         doctor_note = None
+        
+
+
     comprehensive_context = {
-        "patient_details": {"age": lab_data_dict.get('Yaş'), "gender": "Erkek" if lab_data_dict.get('Cinsiyet') == 1 else "Kadın", "alcohol_consumption": alcohol_consumption, "smoking_status": smoking_status, "hcv_status": hcv_status, "hbv_status": hbv_status, "cancer_history_status": cancer_history_status, "afp_value": afp_value},
-        "lab_result": lab_result, "usg_result": usg_result, "mri_analysis": mri_analysis_result, "doctor_note": doctor_note
- 
+        "patient_details": {
+            "age": lab_data_dict.get('Yaş'),
+            "gender": "Erkek" if lab_data_dict.get('Cinsiyet') == 1 else "Kadın",
+            "alcohol_consumption": alcohol_consumption,
+            "smoking_status": smoking_status,
+            "hcv_status": hcv_status,
+            "hbv_status": hbv_status,
+            "cancer_history_status": cancer_history_status,
+            "afp_value": afp_value
+        },
+        "lab_result": lab_result,
+        "usg_result": usg_result,
+        "mri_analysis": mri_analysis_result,
+        "doctor_note": doctor_note  # Artık her zaman tanımlı olacağı için hata vermez.
     }
+    
     gemini_comprehensive_report = await generate_gemini_comprehensive_report(comprehensive_context)
     detailed_report_summary.append("Gemini Bütünsel Değerlendirmesi: Başarıyla oluşturuldu.")
 
