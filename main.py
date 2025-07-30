@@ -12,25 +12,30 @@ import pandas as pd
 import io
 from PIL import Image
 import os
+import tempfile
 import uvicorn
-import tempfile 
-
-# --- Makine Öğrenmesi ve Derin Öğrenme Kütüphaneleri ---
 from passlib.context import CryptContext
 import joblib
 import tensorflow as tf
 import numpy as np
 import nibabel as nib
 from scipy.ndimage import label
-import google.generativeai as genai
 
 # --- Yerel Dosyalar ---
-from database import Base, engine, get_db, User, Patient, Evaluation 
+from database import Base, engine, get_db, User, Patient, Evaluation
+from llm_services import (
+    load_all_llms,
+    generate_radiology_report_vlm,
+    generate_comprehensive_report
+)
 
 # --- UYGULAMA AYARLARI ---
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
-Base.metadata.create_all(bind=engine) 
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+Base.metadata.create_all(bind=engine)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+app = FastAPI(title="Gelişmiş HCC Erken Teşhis Sistemi API")
+origins = ["http://localhost", "http://localhost:3000"]
+app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- MODEL ve DOSYA YOLLARI ---
 LAB_MODEL_PATH = 'hcc_multi_model_xgboost.joblib'
@@ -39,13 +44,10 @@ USG_MODEL_PATH = 'fibroz_vgg16_model.h5'
 MRI_MODEL_PATH = 'MR_model.h5'
 
 # Global model değişkenleri
-model_lab, scaler_lab, model_usg, model_mri, gemini_model = None, None, None, None, None
-
-CLASS_NAMES = ['F0- Fibroz yok', 'F1- Hafif Fibroz', 'F2- Orta Fibroz', 'F3- Ağır Fibroz', 'F4- Siroz'] 
+model_lab, scaler_lab, model_usg, model_mri = None, None, None, None
+CLASS_NAMES = ['F0- Fibroz yok', 'F1- Hafif Fibroz', 'F2- Orta Fibroz', 'F3- Ağır Fibroz', 'F4- Siroz']
 
 # --- PYDANTIC MODELLERİ ---
-# main.py dosyasındaki diğer Pydantic modellerinin yanına ekleyin
-
 class PatientResponse(BaseModel):
     id: int
     tc: str
@@ -53,9 +55,9 @@ class PatientResponse(BaseModel):
     surname: str
     age: Optional[int]
     gender: Optional[str]
-
     class Config:
-        from_attributes = True # SQLAlchemy modelleriyle uyumlu çalışmasını sağlar
+        from_attributes = True
+
 class UserCreate(BaseModel):
     name: Optional[str] = None
     surname: Optional[str] = None
@@ -76,19 +78,13 @@ class LabData(BaseModel):
     BIL: float
     GGT: float
 
-# --- FastAPI UYGULAMASI ve CORS ---
-app = FastAPI(title="Gelişmiş HCC Erken Teşhis Sistemi API") 
-origins = ["http://localhost", "http://localhost:3000"]
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
-
 # --- YARDIMCI FONKSİYONLAR ---
-def preprocess_slice_mri(slice_2d, target_size=(128, 128)): 
+def preprocess_slice_mri(slice_2d, target_size=(128, 128)):
     slice_2d = (slice_2d - np.min(slice_2d)) / (np.max(slice_2d) - np.min(slice_2d) + 1e-8)
-    slice_resized = tf.image.resize(slice_2d[..., np.newaxis], target_size) 
-    return tf.expand_dims(slice_resized, axis=0) 
+    slice_resized = tf.image.resize(slice_2d[..., np.newaxis], target_size)
+    return tf.expand_dims(slice_resized, axis=0)
 
-def filter_predicted_volume_mri(volume, min_voxel=500): 
+def filter_predicted_volume_mri(volume, min_voxel=500):
     filtered_volume = volume.copy()
     tumor_mask = (filtered_volume == 2).astype(np.uint8)
     structure = np.ones((3, 3, 3))
@@ -98,21 +94,23 @@ def filter_predicted_volume_mri(volume, min_voxel=500):
             filtered_volume[labeled_array == region_idx] = 0
     return filtered_volume
 
-def count_nodules_mri(volume): 
+def count_nodules_mri(volume):
     tumor_mask = (volume == 2).astype(np.uint8)
     structure = np.ones((3, 3, 3))
     _, num_features = label(tumor_mask, structure=structure)
     return num_features
 
 def classify_stage_mri(tumor_ratio, nodule_count, pst_score):
-    if pst_score >= 3: return "Evre D - Son Evre" 
+    if pst_score >= 3: return "Evre D - Son Evre"
     if tumor_ratio > 50 or nodule_count > 5 or pst_score == 2: return "Evre C - İleri Evre"
     if tumor_ratio > 25 or nodule_count > 2: return "Evre B - Orta Evre"
     if tumor_ratio > 5 or nodule_count > 0: return "Evre A - Erken Evre"
     if tumor_ratio > 0: return "Evre 0 - Çok Erken Evre"
     return "Evre 0 - Tümör Tespit Edilmedi"
 
-async def predict_lab_risk(data: LabData): 
+# main.py dosyasındaki bu fonksiyonu güncelleyin
+
+async def predict_lab_risk(data: LabData):
     if model_lab is None or scaler_lab is None: raise HTTPException(status_code=500, detail="Lab modeli veya scaler yüklenmedi.")
     features_order_lab = ['Yaş', 'Cinsiyet', 'Albumin', 'ALP', 'ALT', 'AST', 'BIL', 'GGT']
     input_df_lab = pd.DataFrame([data.model_dump()], columns=features_order_lab)
@@ -121,9 +119,20 @@ async def predict_lab_risk(data: LabData):
     predicted_class_id = np.argmax(predictions_proba)
     disease_map = {0: "Sağlıklı", 1: "Hepatit", 2: "Fibröz", 3: "Siroz", 4: "HCC"}
     predicted_disease = disease_map.get(predicted_class_id, "Bilinmiyor")
-    hcc_prob = predictions_proba[4] if len(predictions_proba) > 4 else 0.0
+    
+    # --- DÜZELTME BURADA ---
+    # NumPy float32'yi standart Python float'a çeviriyoruz
+    hcc_prob = float(predictions_proba[4]) if len(predictions_proba) > 4 else 0.0
+    
     risk_level = "Yüksek Risk" if hcc_prob >= 0.66 else "Orta Risk" if hcc_prob >= 0.33 else "Düşük Risk"
-    return {"predicted_disease": predicted_disease, "hcc_probability": hcc_prob, "risk_level": risk_level}
+    
+    return {
+        "predicted_disease": predicted_disease, 
+        # --- DÜZELTME BURADA ---
+        # Sonucun da standart float olduğundan emin oluyoruz
+        "hcc_probability": float(hcc_prob), 
+        "risk_level": risk_level
+    }
 
 async def predict_usg_fibrosis(file_bytes: bytes):
     if model_usg is None: raise HTTPException(status_code=500, detail="USG modeli yüklenmedi.")
@@ -166,95 +175,23 @@ async def predict_mri_analysis(file_bytes: bytes, original_filename: str, pst_sc
         if os.path.exists(temp_filepath):
             os.remove(temp_filepath)
 
-# --- GEMINI FONKSİYONLARI ---
-async def generate_radiology_report_vlm(image_bytes: bytes, predicted_stage_label: str):
-    if gemini_model is None: return "VLM raporu oluşturulamadı: Gemini modeli yüklenmedi."
-    prompt_template = f"""Aşağıdaki ultrason görüntüsünü değerlendir. Tanı: {predicted_stage_label}. Sadece bu görüntüye göre hastalığın mevcut evresine dair tıbbi bir rapor oluştur. Raporun başında hangi evre olduğu açıkça belirtilmeli. Ortalama 4-5 cümlelik, profesyonel ve tıbbi bir dille yazılmış, açıklayıcı ve yapılandırılmış bir **SONUÇ** bölümü üret. Giriş cümlesi ya da açıklama yapma; sadece sonuç bölümünü üret."""
-    try:
-        img_for_vlm = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-        response = await gemini_model.generate_content_async([prompt_template, img_for_vlm])
-        return response.text.replace('\n', '<br>').replace('**', '<b>').replace('</b>', '')
-    except Exception as e:
-        return f"Gemini VLM Raporu oluşturma hatası: {e}"
-
-async def generate_gemini_comprehensive_report(context: Dict): 
-    if gemini_model is None: return "Bütünsel rapor oluşturulamadı: Gemini modeli yüklenmemiş."
-    lab_report = context.get("lab_result", {})
-    usg_report = context.get("usg_result", {})
-    mri_report = context.get("mri_analysis", {})
-    doctor_note = context.get("doctor_note", None)
-    patient_info = context.get("patient_details", {})
-    prompt = f""" 
-# GÖREV VE ROL
-Sen, hepatoloji ve onkoloji alanlarında uzmanlaşmış, farklı tıbbi verileri sentezleyerek kapsamlı bir klinik değerlendirme raporu hazırlayan bir yapay zeka asistanısın. Görevin, aşağıda sunulan verileri analiz ederek bütüncül, yapılandırılmış ve profesyonel bir tıbbi rapor oluşturmaktır.
-
-# HASTA VERİLERİ
----------------------------------
-**Demografik Bilgiler:**
-* **Yaş:** {patient_info.get('age', 'Belirtilmemiş')}
-* **Cinsiyet:** {patient_info.get('gender', 'Belirtilmemiş')}
-
-**Risk Faktörleri:**
-* **Alkol Tüketimi:** {patient_info.get('alcohol_consumption', 'Belirtilmemiş')}
-* **Sigara Kullanımı:** {patient_info.get('smoking_status', 'Belirtilmemiş')}
-* **HCV Durumu:** {patient_info.get('hcv_status', 'Belirtilmemiş')}
-* **HBV Durumu:** {patient_info.get('hbv_status', 'Belirtilmemiş')}
-* **Ailede Kanser Öyküsü:** {patient_info.get('cancer_history_status', 'Belirtilmemiş')}
-
-**ANALİZ SONUÇLARI**
----------------------------------
-**1. Laboratuvar Veri Analizi (XGBoost Model):**
-* **Tahmin Edilen Durum:** {lab_report.get('predicted_disease', 'Hesaplanmadı')}
-* **HCC Olasılığı:** %{lab_report.get('hcc_probability', 0) * 100:.2f}
-* **Laboratuvar Bazlı Risk:** {lab_report.get('risk_level', 'Hesaplanmadı')}
-
-**2. Ultrason (USG) Görüntü Analizi (VGG16 Model):**
-* **Tespit Edilen Fibrozis Evresi:** {usg_report.get('stage_label', 'USG verisi yok')}
-
-**3. Manyetik Rezonans (MR) Görüntü Analizi (3D U-Net Model):**
-* **Tespit Edilen Nodül Sayısı:** {mri_report.get('nodule_count', 'MR verisi yok')}
-* **Karaciğerdeki Tümör Oranı:** %{mri_report.get('tumor_ratio', 'MR verisi yok')}
-* **MR Bazlı Evre Tahmini:** {mri_report.get('stage', 'MR verisi yok')}
-
-**4. Klinik Notlar:**
-* **Doktorun Notu:** {doctor_note if doctor_note else "Belirtilmemiş"}
-
-# İSTENEN RAPOR FORMATI
-Lütfen aşağıdaki başlıkları kullanarak, yukarıdaki verileri sentezleyen detaylı bir rapor oluştur.
-
-**1. Klinik Özet:** (Hastanın genel durumu ve en önemli bulgular hakkında 1-2 cümlelik bir özet.)
-**2. Bulguların Entegrasyonu ve Yorumlanması:** (Laboratuvar, USG ve MR bulgularının birbiriyle nasıl ilişkili olduğunu açıkla.)
-**3. Bütünsel Risk Değerlendirmesi:** (Tüm veriler ışığında hastanın genel HCC riskini belirt ve bu sonuca nasıl ulaştığını açıkla.)
-**4. Klinik Öneri ve Sonraki Adımlar:** (Bu bulgular doğrultusunda hekime yönelik spesifik öneriler sun.)
-**5. Doktor Notu Üzerine Ek Gözlemler:** (Doktorun sağladığı klinik not temel alınarak varsa ilave yorumlar yap.)
-"""
-    try: 
-        response = await gemini_model.generate_content_async(prompt) 
-        return response.text
-    except Exception as e:
-        return f"Gemini Bütünsel Rapor oluşturma hatası: {e}"
-
+# --- UYGULAMA BAŞLANGIÇ OLAYLARI ---
 @app.on_event("startup")
 async def load_models_on_startup():
-    global model_lab, scaler_lab, model_usg, model_mri, gemini_model
-    print("--- Modeller Yükleniyor ---")
+    global model_lab, scaler_lab, model_usg, model_mri
+    print("--- Makine Öğrenmesi Modelleri Yükleniyor ---")
     try:
         if os.path.exists(LAB_MODEL_PATH): model_lab = joblib.load(LAB_MODEL_PATH)
         if os.path.exists(LAB_SCALER_PATH): scaler_lab = joblib.load(LAB_SCALER_PATH)
         if os.path.exists(USG_MODEL_PATH): model_usg = tf.keras.models.load_model(USG_MODEL_PATH, compile=False)
         if os.path.exists(MRI_MODEL_PATH): model_mri = tf.keras.models.load_model(MRI_MODEL_PATH, compile=False)
         print("✅ Lab, USG, MRI Modelleri: Yüklendi")
-        if os.path.exists('api_key.txt'):
-            with open('api_key.txt', 'r') as f: GEMINI_API_KEY = f.read().strip()
-            genai.configure(api_key=GEMINI_API_KEY)
-            gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
-            print("✅ Gemini Modeli (VLM ve LLM için): Yapılandırıldı")
-        else:
-            print("⚠️ UYARI: `api_key.txt` (Gemini için) dosyası bulunamadı.")
     except Exception as e:
-        print(f"HATA: Modeller yüklenirken bir sorun oluştu: {e}")
+        print(f"HATA: ML modelleri yüklenirken bir sorun oluştu: {e}")
+    load_all_llms()
 
-@app.post("/register", status_code=201) 
+# --- API ENDPOINT'LERİ ---
+@app.post("/register", status_code=201)
 def register_user(user: UserCreate, db: Session = Depends(get_db)):
     db_user = db.query(User).filter(User.email == user.email).first()
     if db_user: raise HTTPException(status_code=400, detail="Bu e-posta adresi zaten kayıtlı.")
@@ -270,13 +207,14 @@ def login_user(user: UserLogin, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail="E-posta veya şifre hatalı.")
     return {"message": "Giriş başarılı!", "user_id": db_user.id, "user_name": db_user.name}
 
-@app.post("/evaluate_hcc_risk") 
+@app.post("/evaluate_hcc_risk")
 async def evaluate_hcc_risk(
     user_id: int = Form(...),
     patient_name: str = Form(...),
     patient_surname: str = Form(...),
     patient_tc: str = Form(...),
     lab_data: str = Form(...),
+    doctor_name: str = Form(...),
     usg_file: Optional[UploadFile] = File(None),
     mri_file: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
@@ -289,28 +227,16 @@ async def evaluate_hcc_risk(
     pst_score: Optional[int] = Form(0),
     doctor_note: Optional[str] = Form(None)
 ):
-    # TC kimlik numarasının boş veya sadece boşluklardan oluşup oluşmadığını kontrol et
     if not patient_tc or not patient_tc.strip():
-        raise HTTPException(
-            status_code=400, 
-            detail="TC Kimlik Numarası alanı zorunludur ve boş bırakılamaz."
-        )
+        raise HTTPException(status_code=400, detail="TC Kimlik Numarası zorunludur.")
 
-    overall_risk_level = "Düşük Risk"
-    detailed_report_summary = []
-    vlm_radiology_report = None
-    mri_analysis_result = {}
-    lab_result = {}
-    usg_result = {}
-    gemini_comprehensive_report = None
-    api_result = {}
-
+    lab_result, usg_result, mri_analysis_result = {}, {}, {}
+    vlm_report_data, comprehensive_report_data = {}, {}
+    
     try:
         lab_data_dict = json.loads(lab_data)
         lab_data_pydantic = LabData(**lab_data_dict)
         lab_result = await predict_lab_risk(lab_data_pydantic)
-        detailed_report_summary.append(f"Laboratuvar Analizi: {lab_result['predicted_disease']}, Risk: {lab_result['risk_level']}")
-        overall_risk_level = lab_result['risk_level']
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Lab verisi hatası: {e}")
 
@@ -318,22 +244,20 @@ async def evaluate_hcc_risk(
         try:
             contents = await usg_file.read()
             usg_result = await predict_usg_fibrosis(contents)
-            detailed_report_summary.append(f"USG Analizi: Fibrozis Evresi: {usg_result['stage_label']}")
-            if usg_result["stage_id"] >= 3: overall_risk_level = "Yüksek Risk"
-            elif usg_result["stage_id"] >= 1 and overall_risk_level == "Düşük Risk": overall_risk_level = "Orta Risk"
-            vlm_radiology_report = await generate_radiology_report_vlm(contents, usg_result['stage_label'])
+            vlm_report_data = await generate_radiology_report_vlm(contents, usg_result['stage_label'], doctor_name)
         except Exception as e:
-            detailed_report_summary.append(f"USG Analizi Hatası: {e}")
+            print(f"USG dosyası işleme hatası: {e}")
+            usg_result = {"error": "USG dosyası işlenemedi."}
+            vlm_report_data = {"text": "USG hatası nedeniyle VLM raporu oluşturulamadı.", "model_used": "N/A"}
 
     if mri_file and mri_file.filename:
         try:
             mri_contents = await mri_file.read()
             mri_analysis_result = await predict_mri_analysis(mri_contents, mri_file.filename, pst_score=pst_score)
-            detailed_report_summary.append(f"MRI Analizi: Evre: {mri_analysis_result['stage']}, Oran: {mri_analysis_result['tumor_ratio']}%, Nodül: {mri_analysis_result['nodule_count']}")
-            if mri_analysis_result.get("nodule_count", 0) > 0: overall_risk_level = "Yüksek Risk"
         except Exception as e:
-            detailed_report_summary.append(f"MRI Analizi Hatası: {e.detail if isinstance(e, HTTPException) else str(e)}")
-    
+            print(f"MRI dosyası işleme hatası: {e}")
+            mri_analysis_result = {"error": "MRI dosyası işlenemedi."}
+
     comprehensive_context = {
         "patient_details": {
             "age": lab_data_dict.get('Yaş'),
@@ -346,29 +270,15 @@ async def evaluate_hcc_risk(
         "mri_analysis": mri_analysis_result, "doctor_note": doctor_note
     }
     
-    gemini_comprehensive_report = await generate_gemini_comprehensive_report(comprehensive_context)
-    if gemini_comprehensive_report:
-        detailed_report_summary.append("Gemini Bütünsel Değerlendirmesi: Başarıyla oluşturuldu.")
-
-    if overall_risk_level == "Yüksek Risk": final_recommendation = "Yüksek düzeyde HCC riski. Uzman değerlendirmesi, biyopsi ve multidisipliner konsey önerilir."
-    elif overall_risk_level == "Orta Risk": final_recommendation = "Orta düzeyde HCC riski. MRI görüntülemesi ve 6 ayda bir AFP/USG ile yakın takip önerilir."
-    else: final_recommendation = "HCC riski düşük. Rutin yıllık kontroller önerilir."
+    comprehensive_report_data = await generate_comprehensive_report(comprehensive_context, doctor_name)
     
-    api_result = {
-        "overall_risk_level": overall_risk_level,
-        "final_recommendation": final_recommendation, 
-        "detailed_report_summary": detailed_report_summary,
-        "vlm_radiology_report": vlm_radiology_report,
-        "mri_analysis": mri_analysis_result,
-        "gemini_comprehensive_report": gemini_comprehensive_report
-    }
-
+    # --- GERİ ALINDI: Orijinal veritabanı kayıt mantığı ---
     try:
         patient_to_use = db.query(Patient).filter(Patient.tc == patient_tc.strip()).first()
         if not patient_to_use:
             patient_to_use = Patient(
                 tc=patient_tc.strip(), name=patient_name, surname=patient_surname,
-                age=lab_data_dict.get('Yaş'), 
+                age=lab_data_dict.get('Yaş'),
                 gender="Erkek" if lab_data_dict.get('Cinsiyet') == 1 else "Kadın",
                 user_id=user_id
             )
@@ -376,26 +286,40 @@ async def evaluate_hcc_risk(
             db.commit()
             db.refresh(patient_to_use)
         
-        patient_details_for_db = {
+        # Orijinal, tek parça JSON objesi oluşturuluyor
+        db_data_to_save = {
             "lab_data": lab_data_dict, "afp_value": afp_value,
             "risk_factors": {"alcohol": alcohol_consumption, "smoking": smoking_status, "hcv": hcv_status, "hbv": hbv_status, "cancer_history": cancer_history_status},
-            "usg_report_vlm": vlm_radiology_report, "mri_analysis_summary": mri_analysis_result,
-            "gemini_report": gemini_comprehensive_report, "doctor_note": doctor_note
+            "usg_report_vlm": vlm_report_data.get("text"),
+            "mri_analysis_summary": mri_analysis_result,
+            "comprehensive_report": comprehensive_report_data.get("text"),
+            "vlm_model_used": vlm_report_data.get("model_used"),
+            "comprehensive_model_used": comprehensive_report_data.get("model_used"),
+            "doctor_note": doctor_note
         }
+        
         new_evaluation = Evaluation(
-            patient_id=patient_to_use.id, 
-            evaluation_date=datetime.utcnow(), 
-            patient_details_json=json.dumps(patient_details_for_db), 
-            api_result_json=json.dumps(api_result)
+            patient_id=patient_to_use.id,
+            evaluation_date=datetime.utcnow(),
+            patient_details_json=json.dumps(db_data_to_save),
+            api_result_json=json.dumps(db_data_to_save) # Her iki sütuna da aynı veri kaydediliyor
         )
         db.add(new_evaluation)
         db.commit()
     except Exception as e:
         db.rollback()
         print(f"Veritabanı Kayıt Hatası: {e}")
-        api_result["db_error"] = f"Sonuç üretildi ancak veritabanına kaydedilemedi: {e}"
 
-    return api_result
+    return {
+        "lab_result": lab_result,
+        "usg_result": usg_result,
+        "mri_analysis": mri_analysis_result,
+        "vlm_radiology_report": vlm_report_data.get("text"),
+        "vlm_model_used": vlm_report_data.get("model_used"),
+        "comprehensive_report": comprehensive_report_data.get("text"),
+        "comprehensive_model_used": comprehensive_report_data.get("model_used"),
+    }
 
-if __name__ == "__main__": 
+# --- ÇALIŞTIRMA BLOĞU ---
+if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 
