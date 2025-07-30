@@ -1,4 +1,3 @@
-# hcc_backend_api/database.py
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.ext.declarative import declarative_base
@@ -13,9 +12,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # --- VERİTABANI MODELLERİ (TABLOLAR) ---
-# Bu sınıflar, SQL'deki tablolarınızı temsil eder.
-
-class User(Base):
+class User(Base): 
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String)
@@ -27,6 +24,7 @@ class User(Base):
 class Patient(Base):
     __tablename__ = "patients"
     id = Column(Integer, primary_key=True, index=True)
+    tc = Column(String, unique=True, index=True, nullable=False)
     name = Column(String, index=True)
     surname = Column(String, index=True)
     age = Column(Integer)
@@ -51,4 +49,4 @@ def get_db():
     try:
         yield db
     finally:
-        db.close()
+        db.close() 
