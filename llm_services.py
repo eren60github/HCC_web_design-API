@@ -6,6 +6,7 @@ from PIL import Image
 from datetime import datetime
 import google.generativeai as genai
 from groq import Groq, APIStatusError
+from openai import OpenAI
 
 # --- Yapılandırma ---
 llm_clients = {}
@@ -14,7 +15,7 @@ DOCTOR_LLM_MAP = {
     "Dr. Can": "gemini-pro",
     "Dr. Murat": "groq-llama3-70b",
     "Dr. Elif": "groq-llama3-8b",
-    "Dr. Zeynep": "gemini-flash",
+    "Dr. Zeynep": "deepseek-deepseek-chat",
     "default": "gemini-flash"
 }
 
@@ -60,7 +61,24 @@ def load_all_llms():
     except Exception as e:
         print(f"HATA: Groq servisi başlatılırken bir sorun oluştu: {e}")
 
+# ... (Groq servisinin yapılandırma bloğu bittikten sonra)
 
+    # --- DeepSeek Servisini Başlat ---
+    try:
+        DEEPSEEK_API_KEY = api_keys.get("DEEPSEEK_API_KEY")
+        if DEEPSEEK_API_KEY:
+            # DeepSeek istemcisi OpenAI kütüphanesi ile yapılandırılır
+            llm_clients['deepseek'] = OpenAI(
+                api_key=DEEPSEEK_API_KEY,
+                base_url="https://api.deepseek.com/v1"
+            )
+            print("✅ DeepSeek Servisi: Yapılandırıldı")
+        else:
+            print("⚠️ UYARI: api_keys.txt dosyasında DEEPSEEK_API_KEY bulunamadı.")
+    except Exception as e:
+        print(f"HATA: DeepSeek servisi başlatılırken bir sorun oluştu: {e}")
+
+        
 # --- Diğer Fonksiyonlar (Aynı Kalacak) ---
 # get_model_info_for_doctor, generate_radiology_report_vlm, ve 
 # generate_comprehensive_report fonksiyonlarında hiçbir değişiklik yapmanıza gerek yok.
@@ -159,6 +177,15 @@ Aşağıdaki başlıkları kullanarak, yukarıdaki verileri sentezleyen detaylı
                 model=model_to_use,
             )
             return {"text": chat_completion.choices[0].message.content, "model_used": model_to_use}
+
+        elif service_name == 'deepseek':
+            # model_name değişkeni DOCTOR_LLM_MAP'ten 'deepseek-chat' olarak gelir
+            chat_completion = client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model=model_name,
+            )
+            return {"text": chat_completion.choices[0].message.content, "model_used": model_name}
+
 
     except APIStatusError as e:
         return {"text": f"API Hatası ({service_name}): {e.status_code} - {e.message}", "model_used": "Hata"}
