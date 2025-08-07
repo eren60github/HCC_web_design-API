@@ -101,3 +101,4 @@ groq
 python-dotenv
 
 gunicorn # Sabit bırakıldı (manuel eklenmişti)
+
